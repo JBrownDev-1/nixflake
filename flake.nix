@@ -1,30 +1,22 @@
 {
+  description = "NixOS Flake Configuration";
+
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    home-manager = {
-      url = "github:nix-community/home-manager";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
-    ghostty = {
-      url = "github:ghostty-org/ghostty";
-    };
+    # You can change this to "github:nixos/nixpkgs/nixos-24.05" for stable
+    nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
   };
 
-  outputs = { nixpkgs, home-manager, ghostty, ... }: {
-    nixosConfigurations."nixos" = nixpkgs.lib.nixosSystem {
-      system = "x86_64-linux";
-      modules = [
-        ./configuration.nix
-        home-manager.nixosModules.home-manager
-        {
-          home-manager.useGlobalPkgs = true;
-          home-manager.useUserPackages = true;
-          home-manager.users.jake = { ... }: {
-            imports = [ ./home.nix ];
-            home.packages = [ ghostty.packages.x86_64-linux.default ];
-          };
-        }
-      ];
+  outputs = { self, nixpkgs, ... }@inputs: {
+    nixosConfigurations = {
+      # Replace "myhost" with your actual hostname
+      nixos = nixpkgs.lib.nixosSystem {
+        system = "x86_64-linux"; # Change if using aarch64-linux (e.g., Raspberry Pi)
+        modules = [
+          # Import your existing configuration files
+          ./hardware-configuration.nix
+          ./configuration.nix
+        ];
+      };
     };
   };
 }

@@ -1,69 +1,201 @@
-{ config, pkgs, ... }:
+{ config, pkgs, lib, ... }:
 
 {
-  imports = [ ./hardware-configuration.nix ];
+  imports = [
+    ./hardware-configuration.nix
+  ];
 
-  # Core System Configuration
+  # =========================================================================
+  # 1. SYSTEM & NIX DAEMON CONFIGURATION
+  # =========================================================================
+
+  # Tracks the initial NixOS release version for stateful data compatibility
   system.stateVersion = "25.05";
-  nixpkgs.config.allowUnfree = true;
-  nix.settings.experimental-features = [ "nix-command" "flakes" ];
 
-  # Boot and Hardware Configuration
-  boot.loader = {
-    systemd-boot.enable = true;
-    efi.canTouchEfiVariables = true;
+  # Allow proprietary software (e.g., Steam, Discord, Vivaldi codecs)
+  nixpkgs.config.allowUnfree = true;
+
+  nix = {
+    settings = {
+      # Enable Flakes and the new command-line interface
+      experimental-features = [ "nix-command" "flakes" ];
+
+      # Automatically deduplicate Nix store paths to conserve disk space
+      auto-optimise-store = true;
+
+      # Storage boundaries for garbage collection / build thresholds
+      min-free = 10 * 1024 * 1024 * 1024; # 10 GB
+      max-free = 20 * 1024 * 1024 * 1024; # 20 GB
+    };
+
+    # Automated weekly maintenance to prune old generations
+    gc = {
+      automatic = true;
+      dates = "weekly";
+      options = "--delete-older-than 10d";
+    };
   };
 
-  # Graphics and GPU Configuration
+  # =========================================================================
+  # 2. BOOTLOADER & KERNEL CONFIGURATION
+  # =========================================================================
+
+  boot = {
+    # Pinning a modern LTS/stable kernel for hardware support & Zenpower compatibility
+    kernelPackages = pkgs.linuxPackages_6_12;
+
+    loader = {
+      systemd-boot = {
+        enable = true;
+        configurationLimit = 3; # Restrict generation list in the boot menu
+      };
+      efi.canTouchEfiVariables = true;
+    };
+
+    kernelParams = [
+      # AMD IOMMU & Virtualization Passthrough settings
+      "amd_iommu=on"
+      "iommu=pt"
+      "kvm.ignore_msrs=1"
+      "kvm.report_ignored_msrs=0"
+
+      # Enable overdrive/powerplay controls for AMDGPU (required for CoreCtrl)
+      "amdgpu.ppfeaturemask=0xffffffff"
+    ];
+
+    kernelModules = [
+      "zenpower" # In-tree Ryzen thermal and power monitoring
+      "kvm-amd"
+      "i2c-dev"
+    ];
+
+    extraModulePackages = with config.boot.kernelPackages; [
+      zenpower
+    ];
+
+    kernel.sysctl = {
+      # Permits rootless containers/dev servers to bind to lower standard ports
+      "net.ipv4.ip_unprivileged_port_start" = 80;
+    };
+  };
+
+  # =========================================================================
+  # 3. HARDWARE & GRAPHICS (AMDGPU / ROCm)
+  # =========================================================================
+
   hardware = {
+    amdgpu.opencl.enable = true;
+
     graphics = {
       enable = true;
+      enable32Bit = true; # Critical for 32-bit Wine / Steam titles
       extraPackages = with pkgs; [
-          amdvlk
-
-          rocmPackages.rocm-smi
-          rocmPackages.rocminfo
-          vulkan-loader
-          vulkan-tools
-          vulkan-validation-layers
-          glxinfo
-
-
-      libvdpau
-      mesa.drivers
-
-
-
-      libva
-      libva-utils
-      rocmPackages.clr
-      rocmPackages.rocm-runtime
-      ];
-    };
-    bluetooth = {
-      enable = true;
-      powerOnBoot = true;
-      settings.General.Enable = "Source,Sink,Media,Socket";
-    };
-    steam-hardware.enable = true;
-    opengl = {
-      enable = true;
-      extraPackages = with pkgs; [
-
-        amdvlk
+        rocmPackages.clr
+        rocmPackages.rocm-runtime
+        libvdpau
+        libva
+        libva-utils
       ];
     };
   };
 
-  # Display Server and Desktop Environment
+  # Provide standardized paths expected by certain OpenCL/HIP workloads
+  systemd.tmpfiles.rules = [
+    "L+ /opt/rocm/hip - - - - ${pkgs.rocmPackages.clr}"
+  ];
+
+  # Allow CoreCtrl to control CPU/GPU power profiles without running the entire GUI as root
+  security.wrappers.corectrl = {
+    source = "${pkgs.corectrl}/bin/corectrl";
+    capabilities = "cap_sys_nice+ep";
+    owner = "root";
+    group = "root";
+    permissions = "u+rx,g+rx,o+rx";
+  };
+
+  # Embedded device access & flashing permissions
+  services.udev.extraRules = ''
+    # Proffieboard (Lightsaber soundboard flashing)
+    KERNEL=="hidraw*", ATTRS{idVendor}=="289b", MODE="0666"
+    SUBSYSTEM=="usb", ATTRS{idVendor}=="1209", ATTRS{idProduct}=="6668", MODE="0666"
+    SUBSYSTEM=="usb", ATTRS{idVendor}=="0483", ATTRS{idProduct}=="df11", MODE="0666"
+  '';
+
+  # =========================================================================
+  # 4. STORAGE & MOUNT POINTS
+  # =========================================================================
+
+  fileSystems = {
+    # Windows Shared Drive (Dual-boot parity)
+    "/mnt/windowsgames" = {
+      device = "/dev/disk/by-uuid/B06C21526C21149E";
+      fsType = "ntfs-3g";
+      options = [ "defaults" "nofail" "uid=1000" "gid=100" "umask=0022" "rw" ];
+    };
+
+    # High-capacity Btrfs Media Pool
+    "/mnt/stuff16tb" = {
+      device = "/dev/disk/by-uuid/74a59ea5-5267-42b5-89f2-5d92bee3f28b";
+      fsType = "btrfs";
+      options = [
+        "compress=zstd"
+        "nofail"
+        "x-systemd.automount"
+        "x-systemd.idle-timeout=0"    # Prevent cyclic spin-up/down on idle
+        "x-systemd.device-timeout=30" # Allow slow HDD spin-up before systemd aborts mount
+      ];
+    };
+  };
+
+  # Prevent Jellyfin from starting before the dependent storage drive is ready
+  systemd.services.jellyfin.unitConfig.RequiresMountsFor = [ "/mnt/stuff16tb" ];
+
+  # Allow unprivileged users to mount FUSE filesystems with allow_other (e.g. sshfs, rclone)
+  programs.fuse.userAllowOther = true;
+
+  # =========================================================================
+  # 5. NETWORKING & FIREWALL
+  # =========================================================================
+
+  networking = {
+    hostName = "nixos";
+    enableIPv6 = false;
+
+    networkmanager = {
+      enable = true;
+      dns = "systemd-resolved";
+    };
+
+    firewall = {
+      enable = true;
+      # Note: KDE Connect, Sunshine, and Jellyfin configure their standard ports via their respective service modules
+      allowedTCPPortRanges = [ { from = 42000; to = 42001; } ];
+      allowedUDPPortRanges = [ { from = 42000; to = 42001; } ];
+    };
+  };
+
+  services.resolved.enable = true;
+
+  # Local mDNS discovery configuration
+  services.avahi = {
+    enable = true;
+    nssmdns4 = true;
+    openFirewall = true;
+  };
+
+  # =========================================================================
+  # 6. DESKTOP ENVIRONMENT & AUDIO
+  # =========================================================================
+
   services.xserver = {
     enable = true;
     videoDrivers = [ "amdgpu" ];
-    xkb = {
-      layout = "au";
-      variant = "";
-    };
+    xkb.layout = "au";
   };
+
+  services.desktopManager.plasma6.enable = true;
+  services.libinput.enable = true;
+
   services.displayManager = {
     sddm.enable = true;
     autoLogin = {
@@ -71,175 +203,166 @@
       user = "jake";
     };
   };
-  services.desktopManager.plasma6.enable = true;
 
-  # Audio Configuration
+  # Real-time audio configuration with PipeWire
   security.rtkit.enable = true;
   services.pipewire = {
     enable = true;
-    alsa = {
-      enable = true;
-      support32Bit = true;
-    };
+    alsa.enable = true;
+    alsa.support32Bit = true;
     pulse.enable = true;
-  };
-  services.pulseaudio.enable = false;
-
-  # File Systems
-  fileSystems = {
-    "/mnt/media" = {
-      device = "/dev/disk/by-uuid/5d1c0983-80d2-4473-a0c0-4068391ebd05";
-      fsType = "btrfs";
-      options = [ "defaults" "nofail" "compress=zstd" "x-systemd.automount" ];
-    };
-    "/mnt/games" = {
-      device = "/dev/disk/by-uuid/12AC38D937E36F2B";
-      fsType = "ntfs";
-      options = [ "defaults" "nofail" "uid=1000" "gid=100" "umask=002" ];
-    };
-    "/mnt/stuff" = {
-      device = "/dev/disk/by-uuid/de462ad8-f282-4831-92e9-9ce0949d761f";
-      fsType = "btrfs";
-      options = [ "defaults" "nofail" "compress=zstd" "x-systemd.automount" ];
-    };
-    "/mnt/stuff16tb" = {
-      device = "/dev/disk/by-uuid/74a59ea5-5267-42b5-89f2-5d92bee3f28b";
-      fsType = "btrfs";
-      options = [ "defaults" "compress=zstd" "nofail" "noauto" ];
-    };
+    jack.enable = true;
   };
 
-  # Mount Service Configuration
-  systemd.services.delayed-stuff16tb-mount = {
-    description = "Mount 16TB drive after desktop";
-    serviceConfig = {
-      Type = "oneshot";
-      RemainAfterExit = true;
-      ExecStart = "${pkgs.util-linux}/bin/mount /mnt/stuff16tb";
-    };
-    after = [ "plasma-workspace.service" "network.target" ];
-    wants = [ "plasma-workspace.service" ];
-    wantedBy = [ "multi-user.target" ];
-    enable = true;
-  };
+  # =========================================================================
+  # 7. GAMING & STREAMING
+  # =========================================================================
 
-  services.jellyfin = {
-  enable = true;
-  user = "jellyfin";
-  group = "jellyfin";
-
-  };
-
-
-systemd.tmpfiles.rules = [
-  "d /var/cache/jellyfin 0755 jellyfin jellyfin -"
-  "d /var/cache/jellyfin/transcodes 0755 jellyfin jellyfin -"
-  "d /var/lib/jellyfin 0755 jellyfin jellyfin -"
-  "d /var/lib/jellyfin/config 0755 jellyfin jellyfin -"
-];
- systemd.services.jellyfin = {
-  serviceConfig = {
-    SupplementaryGroups = [ "video" "render" ];
-    BindPaths = [
-      "/mnt/stuff:/mnt/stuff"
-      "/mnt/stuff16tb:/mnt/stuff16tb"
-      "/run/opengl-driver:/run/opengl-driver"
-      "/var/lib/jellyfin:/var/lib/jellyfin"
-    ];
-    DeviceAllow = [
-      "/dev/dri/renderD128 rw"
-      "/dev/dri/card0 rw"
-    ];
-    Environment = [
-      "LIBVA_DRIVER_NAME=radeonsi"  # Add this line
-      "LIBVA_DRIVERS_PATH=${pkgs.mesa.drivers}/lib/dri"  # And this line
-    ];
-  };
-  after = [ "network.target" "mnt-stuff.mount" "delayed-stuff16tb-mount.service" ];
-  requires = [ "mnt-stuff.mount" "delayed-stuff16tb-mount.service" ];
-};
-  # Virtualization
-  virtualisation.libvirtd = {
-    enable = true;
-    qemu.package = pkgs.qemu_kvm;
-  };
-
-  # Networking and Firewall
-  networking.firewall = {
-    enable = true;
-    allowedTCPPorts = [ 8096 ];
-  };
-
-  # User and Group Configuration
-  users = {
-    users.jake = {
-      isNormalUser = true;
-      description = "jake";
-      extraGroups = [ "networkmanager" "wheel" "input" "bluetooth" "gamepad" ];
-      packages = with pkgs; [ kdePackages.kate ];
-    };
-    users.jellyfin = {
-      isSystemUser = true;
-      group = "jellyfin";
-      home = "/var/lib/jellyfin";
-    };
-    groups = {
-      jellyfin = {};
-      video.members = [ "jellyfin" "jake" ];
-      render.members = [ "jellyfin" "jake" ];
-    };
-    extraGroups.libvirtd.members = [ "jake" ];
-  };
-
-  # Programs and Services
   programs = {
-    steam = {
-      enable = true;
-      remotePlay.openFirewall = true;
-      dedicatedServer.openFirewall = true;
-      localNetworkGameTransfers.openFirewall = true;
-    };
+    steam.enable = true;
+    gamemode.enable = true;
+    gamescope.enable = true;
+    kdeconnect.enable = true;
   };
 
-  services = {
-    printing.enable = true;
-    blueman.enable = true;
+  services.sunshine = {
+    enable = true;
+    autoStart = true;
+    capSysAdmin = true;  # Required for KMS capture and input injection
+    openFirewall = true; # Dynamically handles Sunshine firewall requirements
   };
 
-  # System Packages
-  environment.systemPackages = with pkgs; [
-    # Core Tools
-    neovim
-    wget
-    git
-    home-manager
+  # =========================================================================
+  # 8. SERVICES & VIRTUALIZATION
+  # =========================================================================
 
-    # System Utilities
-    ntfs3g
-    gnome-boxes
+  # Rootless Podman daemon with Docker CLI drop-in alias
+  virtualisation.podman = {
+    enable = true;
+    dockerCompat = true;
+    defaultNetwork.settings.dns_enabled = true;
+  };
 
-    # Bluetooth Support
-    bluez
-    bluez-tools
-    bluez-alsa
-    input-remapper
+  # Media Server
+  services.jellyfin = {
+    enable = true;
+    user = "jellyfin";
+    group = "jellyfin";
+    openFirewall = true;
+  };
+
+  # Synchronization
+  services.syncthing = {
+    enable = true;
+    openDefaultPorts = true;
+  };
+
+  # General desktop integration services
+  services.flatpak.enable = true;
+  xdg.portal.enable = true;
+  services.printing.enable = true;
+  services.blueman.enable = true;
+  services.spice-vdagentd.enable = true; # VM guest integration utilities
+
+  # =========================================================================
+  # 9. USER ACCOUNTS
+  # =========================================================================
+
+  users.users.jake = {
+    isNormalUser = true;
+    extraGroups = [
+      "wheel"          # Sudo privileges
+      "networkmanager" # Network configuration
+      "video" "render" # Direct hardware/GPU access
+      "input" "gamepad"# Input handling
+      "dialout" "i2c"  # Hardware flashing/serial buses (Arduino/Proffieboard)
+      "kvm" "libvirtd" # Virtualization
+      "docker"         # Podman compatibility socket access
+      "bluetooth"
+    ];
+  };
+
+  # =========================================================================
+  # 10. LOCALIZATION & FONTS
+  # =========================================================================
+
+  time.timeZone = "Australia/Perth";
+  i18n.defaultLocale = "en_AU.UTF-8";
+
+  # Synchronize BIOS clock to local time to prevent desync when dual-booting with Windows
+  time.hardwareClockInLocalTime = true;
+
+  fonts.packages = with pkgs; [
+    noto-fonts
+    noto-fonts-cjk-sans
+    noto-fonts-color-emoji
   ];
 
-  # Localization and Time
-  time.timeZone = "Australia/Perth";
-  i18n = {
-    defaultLocale = "en_AU.UTF-8";
-    extraLocaleSettings = {
-      LC_ADDRESS = "en_AU.UTF-8";
-      LC_IDENTIFICATION = "en_AU.UTF-8";
-      LC_MEASUREMENT = "en_AU.UTF-8";
-      LC_MONETARY = "en_AU.UTF-8";
-      LC_NAME = "en_AU.UTF-8";
-      LC_NUMERIC = "en_AU.UTF-8";
-      LC_PAPER = "en_AU.UTF-8";
-      LC_TELEPHONE = "en_AU.UTF-8";
-      LC_TIME = "en_AU.UTF-8";
-    };
-  };
-}
+  # =========================================================================
+  # 11. SYSTEM PACKAGES
+  # =========================================================================
 
+  environment.systemPackages = with pkgs; [
+    # --- System Diagnostics & Utilities ---
+    htop
+    iotop
+    lm_sensors
+    smartmontools
+    usbutils
+    pciutils
+    util-linux
+    coreutils
+    findutils
+    wget
+    git
+    p7zip
+    unrar
+    unzip
+
+    # --- Networking & Security Analysis ---
+    iperf3
+    tcpdump
+    nmap
+    sshfs
+
+    # --- Containerization & Development ---
+    docker-compose
+    nodejs
+    arduino
+    dfu-util
+
+    # --- Filesystem Drivers ---
+    ntfs3g
+    fuse
+
+    # --- Audio / Video / Graphics Production ---
+    easyeffects
+    mpv
+    yt-dlp
+    darktable
+    qgis
+    kdePackages.libkscreen
+    kdePackages.kate
+
+    # --- Gaming, Compatibility & Emulation ---
+    wine
+    winetricks
+    protontricks
+    protonup-qt
+    mangohud
+
+    # --- Productivity & Communication ---
+    (vivaldi.override {
+      proprietaryCodecs = true;
+      enableWidevine = true;
+    })
+    firefox
+    discord
+    vesktop
+    obsidian
+    qbittorrent
+    jellyfin-media-player
+    bluez
+    bluez-tools
+  ];
+}
